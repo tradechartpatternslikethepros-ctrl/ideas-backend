@@ -1,22 +1,24 @@
 {
   "name": "ideas-backend",
   "version": "1.0.0",
-  "description": "Minimal API for /ideas",
-  "main": "server.js",
-  "type": "module",
+  "private": true,
+  "main": "server.cjs",
+  "license": "MIT",
   "scripts": {
-    "start": "node server.js",
-    "dev": "nodemon server.js"
+    "start": "node server.cjs",
+    "dev": "nodemon server.cjs"
   },
   "dependencies": {
-    "better-sqlite3": "^9.4.0",
     "cors": "^2.8.5",
     "dotenv": "^16.4.5",
     "express": "^4.19.2",
     "morgan": "^1.10.0",
-    "nanoid": "^5.0.7"
+    "multer": "^1.4.5-lts.1"
   },
   "devDependencies": {
-    "nodemon": "^3.1.4"
+    "nodemon": "^3.1.0"
+  },
+  "engines": {
+    "node": ">=18"
   }
 }
