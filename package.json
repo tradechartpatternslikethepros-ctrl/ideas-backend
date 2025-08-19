@@ -5,7 +5,7 @@
   "main": "server.cjs",
   "license": "MIT",
   "scripts": {
-    "start": "node server.cjs",
+    "start": "node server.patched.cjs",
     "dev": "nodemon server.cjs"
   },
   "dependencies": {
