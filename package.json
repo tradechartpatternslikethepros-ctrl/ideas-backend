@@ -2,17 +2,18 @@
   "name": "ideas-backend",
   "version": "1.0.0",
   "private": true,
-  "main": "server.cjs",
+  "main": "index.js",
   "license": "MIT",
   "scripts": {
-    "start": "node server.patched.cjs",
-    "dev": "nodemon server.cjs"
+    "start": "node index.js",
+    "dev": "nodemon index.js"
   },
   "dependencies": {
     "cors": "^2.8.5",
-    "dotenv": "^16.4.5",
-    "express": "^4.19.2",
-    "morgan": "^1.10.0",
+    "dotenv": "^16.6.1",
+    "express": "^4.21.2",
+    "http-proxy-middleware": "^3.0.5",
+    "morgan": "^1.10.1",
     "multer": "^1.4.5-lts.1"
   },
   "devDependencies": {
