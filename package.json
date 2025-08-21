@@ -1,13 +1,20 @@
 {
-  "name":"ideas-backend",
-  "version":"1.0.0",
-  "private":true,
-  "license":"MIT",
-  "main":"server.patched.cjs",
-  "scripts":{"start":"node server.patched.cjs"},
-  "dependencies":{
-    "cors":"^2.8.5","dotenv":"^16.6.1","express":"^4.21.2",
-    "http-proxy-middleware":"^3.0.5","morgan":"^1.10.1","multer":"^1.4.5-lts.1"
+  "name": "ideas-backend",
+  "version": "1.0.1",
+  "private": true,
+  "license": "MIT",
+  "main": "server.patched.cjs",
+  "scripts": {
+    "start": "node server.patched.cjs"
   },
-  "engines":{"node":">=18"}
+  "dependencies": {
+    "cors": "^2.8.5",
+    "dotenv": "^16.6.1",
+    "express": "^4.21.2",
+    "morgan": "^1.10.1",
+    "multer": "^1.4.5-lts.1"
+  },
+  "engines": {
+    "node": ">=18"
+  }
 }
