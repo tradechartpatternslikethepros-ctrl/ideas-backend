@@ -53,16 +53,29 @@ const allowAll = ALLOW_ORIGINS.includes('*');
 const allowSet = new Set(ALLOW_ORIGINS);
 
 /* ======================= Middleware ======================= */
-app.use(cors({
+/** CORS — explicitly allow our custom auth/user headers and answer preflight */
+const corsOptions = {
   origin(origin, cb) {
-    if (!origin) return cb(null, true); // curl / same-origin
+    // allow non-browser clients and same-origin
+    if (!origin) return cb(null, true);
     if (allowAll || allowSet.has(origin)) return cb(null, true);
     return cb(new Error('CORS: Origin not allowed'), false);
   },
-  credentials: false,
-  methods: ['GET','POST','PATCH','DELETE','PUT','OPTIONS'],
-  allowedHeaders: ['Content-Type','Authorization']
-}));
+  methods: ['GET','HEAD','POST','PUT','PATCH','DELETE','OPTIONS'],
+  allowedHeaders: [
+    'Content-Type',
+    'Authorization',
+    'X-User-Id',
+    'X-User-Name',
+    'X-Requested-With'
+  ],
+  exposedHeaders: ['Content-Type','Content-Length','ETag'],
+  maxAge: 86400,              // cache preflight for a day
+  optionsSuccessStatus: 204,  // Safari compat
+  credentials: false
+};
+app.use(cors(corsOptions));
+app.options('*', cors(corsOptions)); // handle preflight for all routes
 
 app.use(morgan('dev'));
 app.use(express.json({ limit: '25mb' })); // base64 images can be big
