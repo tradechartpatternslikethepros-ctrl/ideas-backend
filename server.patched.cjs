@@ -53,7 +53,7 @@ const allowAll = ALLOW_ORIGINS.includes('*');
 const allowSet = new Set(ALLOW_ORIGINS);
 
 /* ======================= Middleware ======================= */
-/** CORS — explicitly allow our custom auth/user headers and answer preflight */
+/** CORS — allow custom auth/user headers & answer all preflights */
 const corsOptions = {
   origin(origin, cb) {
     // allow non-browser clients and same-origin
@@ -62,23 +62,35 @@ const corsOptions = {
     return cb(new Error('CORS: Origin not allowed'), false);
   },
   methods: ['GET','HEAD','POST','PUT','PATCH','DELETE','OPTIONS'],
-  allowedHeaders: [
-    'Content-Type',
-    'Authorization',
-    'X-User-Id',
-    'X-User-Name',
-    'X-Requested-With'
-  ],
+
+  // 👇 Reflect what the browser asked for (covers x-user-id / x-user-name)
+  allowedHeaders(req, cb) {
+    const asked = req.header('Access-Control-Request-Headers');
+    // If no preflight header, fall back to a safe superset
+    cb(
+      null,
+      asked || 'Content-Type,Authorization,X-User-Id,X-User-Name,X-Requested-With'
+    );
+  },
+
   exposedHeaders: ['Content-Type','Content-Length','ETag'],
-  maxAge: 86400,              // cache preflight for a day
-  optionsSuccessStatus: 204,  // Safari compat
-  credentials: false
+  credentials: false,
+  maxAge: 86400,             // cache preflight for a day
+  optionsSuccessStatus: 204, // Safari compat
 };
+
 app.use(cors(corsOptions));
 app.options('*', cors(corsOptions)); // handle preflight for all routes
 
+// help caches/proxies vary correctly
+app.use((req, res, next) => {
+  res.vary('Origin');
+  res.vary('Access-Control-Request-Headers');
+  next();
+});
+
 app.use(morgan('dev'));
-app.use(express.json({ limit: '25mb' })); // base64 images can be big
+app.use(express.json({ limit: '25mb' }));
 app.use(express.urlencoded({ extended: false }));
 
 /* ======================= Helpers ======================= */
