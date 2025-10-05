@@ -1,429 +1,344 @@
-/* server.patched.cjs */
-const express = require("express");
-const cors = require("cors");
-const crypto = require("crypto");
-const nodemailer = require("nodemailer");
+// server.patched.cjs
+require('dotenv').config();
 
-let morgan = null;
-try { morgan = require("morgan"); } catch {}
+const express = require('express');
+const cors = require('cors');
+const helmet = require('helmet');
+const compression = require('compression');
+const rateLimit = require('express-rate-limit');
+const morgan = require('morgan');
+const nodemailer = require('nodemailer');
+const crypto = require('crypto');
 
-const PORT = Number(process.env.PORT) || 8080;
+// ───────────────────────────────────────────────────────────────────────────────
+// Environment
+// ───────────────────────────────────────────────────────────────────────────────
+const {
+  PORT = 8080,
 
-/* ---------- ENV / Config ---------- */
-const ALLOW_ORIGINS = (process.env.ALLOW_ORIGINS
-  ? process.env.ALLOW_ORIGINS.split(",").map(s => s.trim()).filter(Boolean)
-  : [
-      "*.filesusr.com",
-      "*.wixsite.com",
-      "*.wixstatic.com",
-      "*.parastorage.com",
-      "https://www.tradechartpatternslikethepros.com",
-      "https://tradechartpatternslikethepros.com",
-      "https://editor.wix.com",
-      "https://www.wix.com",
-      "http://localhost:3000",
-      "http://127.0.0.1:3000",
-      "https://www-tradechartpatternslikethepros-com.filesusr.com",
-    ]
+  // Auth
+  API_TOKEN,                 // for Authorization: Bearer <token>
+  MAIL_SECRET,               // for X-Mail-Secret: <secret>
+
+  // Mail
+  MAIL_FROM = 'Pro Members <no-reply@example.com>',
+  SMTP_URL,                  // e.g. smtp://USER:PASS@host:587
+  NOTIFY_TO,                 // single fallback email
+  SUBSCRIBERS,               // comma-separated list of recipients
+
+  // CORS
+  ALLOW_ORIGINS,             // CSV allowlist, supports patterns like *.wixsite.com
+} = process.env;
+
+const app = express();
+
+// ───────────────────────────────────────────────────────────────────────────────
+// CORS allowlist helpers
+// ───────────────────────────────────────────────────────────────────────────────
+function hostMatches(pattern, host) {
+  if (!pattern || !host) return false;
+  try { pattern = new URL(pattern).hostname; } catch {}
+  pattern = pattern.toLowerCase().trim();
+  host = host.toLowerCase().trim();
+  if (!pattern.startsWith('*.')) return pattern === host;
+  const suffix = pattern.slice(1); // ".domain.com"
+  return host.endsWith(suffix);
+}
+function parseAllowlist(list) {
+  return (list || '')
+    .split(',')
+    .map(s => s.trim())
+    .filter(Boolean);
+}
+const allowlist = parseAllowlist(
+  ALLOW_ORIGINS ||
+    [
+      'https://www.tradechartpatternslikethepros.com',
+      'https://tradechartpatternslikethepros.com',
+      'https://editor.wix.com',
+      'https://www.wix.com',
+      '*.wixsite.com',
+      '*.wixstatic.com',
+      '*.parastorage.com',
+      '*.filesusr.com',
+      'http://localhost:3000',
+      'http://127.0.0.1:3000',
+      'http://localhost:5173',
+      'http://127.0.0.1:5173',
+    ].join(',')
 );
 
-const AUTH_TOKEN =
-  process.env.API_TOKEN ||
-  process.env.TOKEN ||
-  "4a6ffbf3209fb1392341615d5b6abc6f4db5998a22d825f2615dfd22e3965dfa";
-
-const BASE_URL = process.env.BASE_URL || `http://localhost:${PORT}`;
-const PUBLIC_LIKES = String(process.env.PUBLIC_LIKES || "true").toLowerCase() === "true";
-
-/* Email env (already set in your Railway):
-   SMTP_URL="smtp://USERNAME:PASSWORD@smtp.sendgrid.net:587"
-   NOTIFY_FROM="Pro Members <no-reply@tradechartpatternslikethepros.com>"
-   NOTIFY_TO="alerts@tradechartpatternslikethepros.com"
-*/
-const SMTP_URL = process.env.SMTP_URL || "";
-const NOTIFY_FROM = process.env.NOTIFY_FROM || "";
-const NOTIFY_TO = (process.env.NOTIFY_TO || "").split(",").map(s => s.trim()).filter(Boolean);
-
-/* ---------- Helpers ---------- */
-const nowISO = () => new Date().toISOString();
-const uid = (p = "idea") => `${p}_${crypto.randomBytes(6).toString("base64url")}`;
-
-function isWildcard(pattern) { return typeof pattern === "string" && pattern.startsWith("*."); }
-function hostnameFromOrigin(origin) { try { return new URL(origin).hostname; } catch { return ""; } }
-function isAllowedOrigin(origin) {
-  if (!origin) return true;
-  if (ALLOW_ORIGINS.includes("*") || ALLOW_ORIGINS.includes(origin)) return true;
-  const host = hostnameFromOrigin(origin);
-  if (!host) return false;
-  for (const pat of ALLOW_ORIGINS) {
-    if (isWildcard(pat)) {
-      const suffix = pat.slice(1);
-      if (host.endsWith(suffix)) return true;
-    }
-  }
-  return false;
-}
-
-/** auth */
-function requireAuth(req, res, next) {
-  const auth = req.get("Authorization") || "";
-  const token = auth.startsWith("Bearer ") ? auth.slice(7).trim() : "";
-  if (token && token === AUTH_TOKEN) return next();
-  res.status(401).json({ error: "unauthorized" });
-}
-/** likes may be public if PUBLIC_LIKES=true */
-const requireAuthMaybe = PUBLIC_LIKES ? (_req, _res, next) => next() : requireAuth;
-
-/** summary */
-const summarize = (idea) => idea.levelText || idea.take || "";
-
-/** sanitize idea (don’t leak Sets) */
-function sanitizeIdea(idea) {
-  return {
-    id: idea.id,
-    type: idea.type,
-    title: idea.title,
-    symbol: idea.symbol,
-    link: idea.link,
-    levelText: idea.levelText,
-    take: idea.take,
-    imageUrl: idea.imageUrl,
-    imageData: idea.imageData,
-    authorName: idea.authorName,
-    authorId: idea.authorId,
-    summary: idea.summary,
-    createdAt: idea.createdAt,
-    updatedAt: idea.updatedAt,
-    likeCount: idea.likedBy.size,
-    commentCount: idea.comments.length,
-    comments: idea.comments.map(c => ({
-      id: c.id,
-      text: c.text,
-      authorName: c.authorName,
-      authorId: c.authorId,
-      createdAt: c.createdAt,
-      updatedAt: c.updatedAt,
-    })),
-  };
-}
-
-/* ---------- Email ---------- */
-let mailer = null;
-if (SMTP_URL && NOTIFY_FROM && NOTIFY_TO.length) {
-  try {
-    mailer = nodemailer.createTransport(SMTP_URL);
-    // (optional) verify transport on boot, but don’t crash if it fails
-    mailer.verify().catch(() => {});
-  } catch (_) { mailer = null; }
-}
-
-async function sendIdeaEmail(idea) {
-  if (!mailer) return;
-  const viewUrl = `${BASE_URL}/ideas/${encodeURIComponent(idea.id)}`;
-  const subject =
-    (idea.symbol ? `${idea.symbol} — ` : "") +
-    (idea.title || "New Idea");
-
-  const html = `
-    <div style="font-family:system-ui,-apple-system,Segoe UI,Roboto,Inter,Arial;background:#0b1220;color:#e7ebf5;padding:16px">
-      <h2 style="margin:0 0 8px 0">New Idea Published</h2>
-      <p style="margin:0 0 8px 0"><strong>${escapeHtml(idea.title || "")}</strong></p>
-      ${idea.symbol ? `<p style="margin:0 0 8px 0"><strong>Symbol:</strong> ${escapeHtml(idea.symbol)}</p>` : ""}
-      ${idea.levelText ? `<p style="margin:0 0 8px 0"><strong>Levels:</strong> ${escapeHtml(idea.levelText)}</p>` : ""}
-      ${idea.take ? `<p style="margin:0 0 12px 0"><strong>Take:</strong> ${escapeHtml(idea.take)}</p>` : ""}
-      <p style="margin:12px 0"><a href="${viewUrl}" style="background:#00d0ff;color:#001018;padding:10px 14px;border-radius:10px;text-decoration:none;font-weight:700">Open Idea</a></p>
-      ${idea.link ? `<p style="margin:12px 0 0 0">Chart Link: <a href="${escapeAttr(idea.link)}">${escapeHtml(idea.link)}</a></p>` : ""}
-      <p style="margin:18px 0 0 0;font-size:12px;opacity:.7">Sent by Pro Members Ideas</p>
-    </div>
-  `;
-
-  const text =
-`${idea.title || "New Idea"}
-${idea.symbol ? `Symbol: ${idea.symbol}\n` : ""}${idea.levelText ? `Levels: ${idea.levelText}\n` : ""}${idea.take ? `Take: ${idea.take}\n` : ""}${idea.link ? `Chart: ${idea.link}\n` : ""}Open: ${viewUrl}
-  `.trim();
-
-  try {
-    await mailer.sendMail({
-      from: NOTIFY_FROM,
-      to: NOTIFY_TO,
-      subject,
-      html,
-      text,
-    });
-  } catch (_) {
-    // swallow email errors; notifications are best-effort
-  }
-}
-
-function escapeHtml(s) {
-  return String(s || "")
-    .replace(/&/g,"&amp;").replace(/</g,"&lt;")
-    .replace(/>/g,"&gt;").replace(/"/g,"&quot;").replace(/'/g,"&#39;");
-}
-function escapeAttr(s){ return String(s || "").replace(/"/g, "&quot;"); }
-
-/* ---------- App ---------- */
-const app = express();
-if (morgan) app.use(morgan("tiny"));
-app.use(express.json({ limit: "2mb" }));
-
 const corsOptions = {
-  origin: (origin, cb) => {
-    if (isAllowedOrigin(origin)) return cb(null, true);
-    console.warn("[CORS] blocked origin:", origin);
-    const err = Object.assign(new Error("CORS: Origin not allowed"), { status: 403 });
-    return cb(err);
+  origin(origin, cb) {
+    if (!origin) return cb(null, true); // allow server-to-server / curl
+    let hostname;
+    try { hostname = new URL(origin).hostname; }
+    catch { return cb(new Error('Invalid Origin'), false); }
+    const ok = allowlist.some(p => hostMatches(p, hostname));
+    return cb(ok ? null : new Error('CORS blocked'), ok);
   },
   credentials: true,
-  methods: "GET,HEAD,POST,PUT,PATCH,DELETE,OPTIONS",
-  allowedHeaders: "Authorization, Content-Type, X-User-Id, X-User-Name",
-  exposedHeaders: "Content-Type, Content-Length, ETag",
   maxAge: 86400,
-  optionsSuccessStatus: 204,
 };
+
+// ───────────────────────────────────────────────────────────────────────────────
+// App middleware
+// ───────────────────────────────────────────────────────────────────────────────
+app.use(helmet({ crossOriginResourcePolicy: false }));
 app.use(cors(corsOptions));
-app.options("*", cors(corsOptions));
+app.use(express.json({ limit: '2mb' }));
+app.use(express.urlencoded({ extended: false }));
+app.use(compression());
+app.use(morgan('tiny'));
 
-/* ---------- State (in-memory) ---------- */
-const state = { ideas: [] };
+// Global rate limit (safe default; routes can add more)
+app.use(
+  rateLimit({
+    windowMs: 60 * 1000,
+    max: 120,
+    standardHeaders: true,
+    legacyHeaders: false,
+  })
+);
 
-/* ---------- SSE ---------- */
-const clients = new Set();
+// ───────────────────────────────────────────────────────────────────────────────
+// Auth helpers
+// ───────────────────────────────────────────────────────────────────────────────
+function bearer(req) {
+  const h = req.headers.authorization || '';
+  const [, token] = h.split(' ');
+  return token || null;
+}
 
-function broadcast(event, payload) {
-  const line = `event: ${event}\n` + `data: ${JSON.stringify(payload)}\n\n`;
-  for (const res of clients) {
-    try { res.write(line); } catch {}
+/** Require Authorization: Bearer <API_TOKEN> */
+function requireAuth(req, res, next) {
+  if (!API_TOKEN) return res.status(500).json({ error: 'API_TOKEN not set on server' });
+  const token = bearer(req);
+  if (!token || token !== API_TOKEN) return res.status(401).json({ error: 'unauthorized' });
+  next();
+}
+
+/** Require X-Mail-Secret: <MAIL_SECRET> */
+function requireMailSecret(req, res, next) {
+  if (!MAIL_SECRET) return res.status(500).json({ error: 'MAIL_SECRET not set on server' });
+  const key = req.headers['x-mail-secret'];
+  if (!key || key !== MAIL_SECRET) return res.status(401).json({ error: 'invalid mail secret' });
+  next();
+}
+
+/**
+ * Allow EITHER Bearer token OR Mail secret.
+ * Use this for email notify endpoints so the dashboard can choose.
+ */
+function requireEitherAuth(req, res, next) {
+  const passBearer = API_TOKEN && bearer(req) === API_TOKEN;
+  const passSecret = MAIL_SECRET && req.headers['x-mail-secret'] === MAIL_SECRET;
+  if (passBearer || passSecret) return next();
+  return res.status(401).json({ error: 'unauthorized' });
+}
+
+function parseRecipients() {
+  const list =
+    (SUBSCRIBERS && SUBSCRIBERS.split(',').map(s => s.trim()).filter(Boolean)) ||
+    [];
+  if (!list.length && NOTIFY_TO) list.push(NOTIFY_TO);
+  return list;
+}
+
+// ───────────────────────────────────────────────────────────────────────────────
+// Mailer
+// ───────────────────────────────────────────────────────────────────────────────
+let transporter = null;
+if (SMTP_URL) {
+  try {
+    transporter = nodemailer.createTransport(SMTP_URL);
+    console.log('Mail: SMTP configured');
+  } catch (e) {
+    console.error('Mail: failed to configure SMTP:', e.message);
+  }
+} else {
+  console.log('Mail: SMTP_URL missing (emails will be logged to console)');
+}
+
+async function sendMail({ subject, html, text, to }) {
+  const recipients = to && to.length ? to : parseRecipients();
+  if (!recipients.length) {
+    console.warn('Mail: no recipients; skipping');
+    return { ok: true, skipped: true };
+  }
+  const mail = {
+    from: MAIL_FROM,
+    to: recipients.join(','),
+    subject,
+    text: text || html?.replace(/<[^>]+>/g, ' ').trim(),
+    html: html || `<pre>${(text || '').trim()}</pre>`,
+    headers: { 'List-Unsubscribe': '<mailto:no-reply@invalid>' },
+  };
+  if (transporter) {
+    const info = await transporter.sendMail(mail);
+    return { ok: true, sent: true, id: info.messageId };
+  } else {
+    console.log('[MAIL - DRYRUN]', mail);
+    return { ok: true, logged: true };
   }
 }
 
-function sseHandler(req, res) {
-  res.setHeader("Content-Type", "text/event-stream");
-  res.setHeader("Cache-Control", "no-cache, no-transform");
-  res.setHeader("Connection", "keep-alive");
-  res.setHeader("X-Accel-Buffering", "no");
-  if (typeof res.flushHeaders === "function") res.flushHeaders();
+// ───────────────────────────────────────────────────────────────────────────────
+// Demo stores (swap to DB when ready)
+// ───────────────────────────────────────────────────────────────────────────────
+const ideas = [];
+const events = []; // e.g. { id, title, when, status }
 
-  res.write("retry: 5000\n\n");
-  res.write("event: hello\n");
-  res.write(`data: ${JSON.stringify({ ts: nowISO() })}\n\n`);
-  clients.add(res);
+// ───────────────────────────────────────────────────────────────────────────────
+// Routes
+// ───────────────────────────────────────────────────────────────────────────────
+app.get(['/', '/api'], (req, res) =>
+  res.json({
+    name: 'Ideas Backend',
+    ok: true,
+    docs: ['/health', '/api/health', '/ideas/latest', '/notify-post', '/notify-signal'],
+  })
+);
 
-  const hb = setInterval(() => { try { res.write(":\n\n"); } catch {} }, 10000);
-  req.on("close", () => { clearInterval(hb); clients.delete(res); });
-}
+app.get(['/health', '/api/health', '/api/v1/health'], (req, res) =>
+  res.json({ ok: true })
+);
 
-/* ---------- Routes ---------- */
-
-// Health
-app.get("/healthz", (_req, res) => {
-  res.json({ ok: true, env: process.env.NODE_ENV || "production", uptime: process.uptime() });
+// Latest ideas (demo)
+app.get(['/ideas/latest', '/api/ideas/latest'], (req, res) => {
+  const list = ideas.slice(-15).reverse();
+  res.json({ ok: true, ideas: list });
 });
 
-// List ideas
-app.get("/ideas", (_req, res) => {
-  res.json(state.ideas.map(sanitizeIdea));
-});
-
-// Latest idea
-app.get("/ideas/latest", (_req, res) => {
-  if (!state.ideas.length) return res.status(204).end();
-  const latest = [...state.ideas].sort((a, b) => Date.parse(b.createdAt) - Date.parse(a.createdAt))[0];
-  res.json(sanitizeIdea(latest));
-});
-
-// Get single idea
-app.get("/ideas/:id", (req, res) => {
-  const idea = state.ideas.find(i => i.id === req.params.id);
-  if (!idea) return res.status(404).json({ error: "not found" });
-  res.json(sanitizeIdea(idea));
-});
-
-// Create idea (send email after broadcast; best-effort)
-app.post("/ideas", requireAuth, async (req, res) => {
+// Create idea (protected with Bearer)
+app.post(['/ideas', '/api/ideas'], requireAuth, (req, res) => {
   const {
-    title = "",
-    symbol = "",
-    link = "",
-    levelText = "",
-    take = "",
-    imageUrl = "",
-    imageData = "",
-    authorName = "Member",
-    authorId = "",
-  } = req.body || {};
-  if (!title) return res.status(400).json({ error: "title required" });
-
-  const idea = {
-    id: uid("idea"),
-    type: "idea",
     title,
     symbol,
     link,
     levelText,
-    take,
-    imageUrl,
-    imageData,
     authorName,
-    authorId,
-    summary: summarize({ levelText, take }),
-    likedBy: new Set(),
-    comments: [],
-    createdAt: nowISO(),
-    updatedAt: nowISO(),
+    authorEmail,
+    audience = 'public',
+    source = 'dashboard',
+    type = 'post',
+    image,
+  } = req.body || {};
+  const id = crypto.randomUUID();
+  const when = new Date().toISOString();
+  const idea = {
+    id, title, symbol, link, levelText, authorName, authorEmail,
+    audience, source, type, image, createdAt: when,
   };
-
-  state.ideas.push(idea);
-  const out = sanitizeIdea(idea);
-  broadcast("idea.created", out);
-  res.status(201).json(out);
-
-  // fire-and-forget email
-  sendIdeaEmail(out).catch(() => {});
+  ideas.push(idea);
+  res.json({ ok: true, idea });
 });
 
-// Update idea
-app.patch("/ideas/:id", requireAuth, (req, res) => {
-  const idea = state.ideas.find(i => i.id === req.params.id);
-  if (!idea) return res.status(404).json({ error: "not found" });
+// Events (demo)
+app.get(['/events', '/api/events'], (req, res) => {
+  res.json({ ok: true, events });
+});
 
-  const allowed = ["title", "symbol", "link", "levelText", "take", "imageUrl", "imageData", "authorName", "authorId"];
-  for (const k of allowed) {
-    if (Object.prototype.hasOwnProperty.call(req.body, k)) idea[k] = req.body[k] ?? idea[k];
+// ───────────────────────────────────────────────────────────────────────────────
+// Email notify (POST + SIGNAL) — allows Bearer OR Mail Secret
+// ───────────────────────────────────────────────────────────────────────────────
+function sanitize(x, max = 5000) {
+  return String(x ?? '').toString().slice(0, max);
+}
+function renderEmail(kind, p) {
+  const subject =
+    kind === 'post'
+      ? `[TCPP] New Post — ${p.title}`
+      : `[TCPP] ${String(kind).toUpperCase()} — ${p.title}`;
+
+  const html = `
+    <div style="font-family:system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial">
+      <h2 style="margin:0 0 8px">${subject}</h2>
+      <p><b>By:</b> ${sanitize(p.authorName || 'Member', 120)}${p.symbol ? ` · <b>Symbol:</b> ${sanitize(p.symbol, 40)}` : ''}</p>
+      <p><b>When:</b> ${sanitize(p.createdAt || p.when || new Date().toISOString(), 64)} · <b>Audience:</b> ${sanitize(p.audience || 'paid', 20)}</p>
+      ${p.link ? `<p><b>Link:</b> <a href="${sanitize(p.link, 2048)}">${sanitize(p.link, 2048)}</a></p>` : ''}
+      ${p.imageUrl ? `<p><img alt="chart" src="${sanitize(p.imageUrl, 2048)}" style="max-width:640px;border:1px solid #eee;border-radius:8px"/></p>` : ''}
+      ${p.levelText ? `<p><b>Levels:</b> ${sanitize(p.levelText, 2000)}</p>` : ''}
+      <hr style="border:none;border-top:1px solid #ddd;margin:16px 0"/>
+      <p style="color:#888;font-size:12px;margin:0">Trade Chart Patterns Like The Pros</p>
+    </div>
+  `;
+  return { subject, html };
+}
+
+async function handleNotify(kind, req, res) {
+  const body = req.body || {};
+  const payload = {
+    title: sanitize(body.title || '(no title)', 200),
+    symbol: sanitize(body.symbol || '', 40),
+    link: sanitize(body.link || '', 2048),
+    levelText: sanitize(body.levelText || body.levels || '', 2000),
+    authorName: sanitize(body.authorName || 'Member', 120),
+    authorEmail: sanitize(body.authorEmail || '', 200),
+    audience: sanitize(body.audience || 'paid', 20),
+    source: sanitize(body.source || 'dashboard', 40),
+    type: sanitize(body.type || kind, 20),
+    imageUrl: sanitize(body.imageUrl || '', 2048),
+    createdAt: sanitize(body.createdAt || body.when || new Date().toISOString(), 64),
+  };
+
+  // Also append to in-memory ideas (nice for testing)
+  const id = crypto.randomUUID();
+  ideas.push({
+    id,
+    ...payload,
+    createdAt: new Date().toISOString(),
+  });
+
+  const { subject, html } = renderEmail(kind, payload);
+
+  try {
+    const result = await sendMail({ subject, html, to: parseRecipients() });
+    return res.json({ ok: true, kind, id, mail: result });
+  } catch (e) {
+    console.error(`notify-${kind} mail error:`, e);
+    return res.status(500).json({ ok: false, error: e.message });
   }
-  idea.summary = summarize(idea);
-  idea.updatedAt = nowISO();
+}
 
-  const out = sanitizeIdea(idea);
-  broadcast("idea.updated", out);
-  res.json(out);
+// New post emails
+app.post(['/notify-post', '/api/notify-post'], requireEitherAuth, handleNotify.bind(null, 'post'));
+
+// Signal emails (LIVE/TP/SL/etc.) — send kind via `type` in body (defaults to 'signal')
+app.post(['/notify-signal', '/api/notify-signal'], requireEitherAuth, (req, res) => {
+  const kind = sanitize(req.body?.type || 'signal', 16).toLowerCase(); // 'live' | 'tp' | 'sl' | 'signal'
+  return handleNotify(kind, req, res);
 });
 
-// Delete idea
-app.delete("/ideas/:id", requireAuth, (req, res) => {
-  const idx = state.ideas.findIndex(i => i.id === req.params.id);
-  if (idx === -1) return res.status(404).json({ error: "not found" });
-  const [removed] = state.ideas.splice(idx, 1);
-  broadcast("idea.deleted", { id: removed.id });
-  res.status(204).end();
-});
+// ───────────────────────────────────────────────────────────────────────────────
+// Fallback 404
+// ───────────────────────────────────────────────────────────────────────────────
+app.use((req, res) => res.status(404).json({ error: 'not found', path: req.path }));
 
-// Like / Unlike (PUBLIC_LIKES controls auth)
-app.post("/ideas/:id/like", requireAuthMaybe, (req, res) => {
-  const idea = state.ideas.find(i => i.id === req.params.id);
-  if (!idea) return res.status(404).json({ error: "not found" });
+// ───────────────────────────────────────────────────────────────────────────────
+// Boot
+// ───────────────────────────────────────────────────────────────────────────────
+function listRoutes(app) {
+  const routes = [];
+  app._router?.stack?.forEach(m => {
+    if (m.route?.path) {
+      routes.push(`${Object.keys(m.route.methods).join(',').toUpperCase()} ${m.route.path}`);
+    } else if (m.name === 'router' && m.handle?.stack) {
+      m.handle.stack.forEach(h => {
+        if (h.route?.path) {
+          routes.push(`${Object.keys(h.route.methods).join(',').toUpperCase()} ${h.route.path}`);
+        }
+      });
+    }
+  });
+  console.log('ROUTES:\n' + routes.sort().join('\n'));
+}
 
-  const userId = (req.get("X-User-Id") || "").trim();
-  const userName = (req.get("X-User-Name") || "Member").trim();
-  if (!userId) return res.status(400).json({ error: "X-User-Id header required" });
-
-  idea.likedBy.add(userId);
-  idea.updatedAt = nowISO();
-  broadcast("idea.liked", { id: idea.id, likeCount: idea.likedBy.size, userId, userName });
-  res.json({ id: idea.id, likeCount: idea.likedBy.size });
-});
-
-app.delete("/ideas/:id/like", requireAuthMaybe, (req, res) => {
-  const idea = state.ideas.find(i => i.id === req.params.id);
-  if (!idea) return res.status(404).json({ error: "not found" });
-
-  const userId = (req.get("X-User-Id") || "").trim();
-  if (!userId) return res.status(400).json({ error: "X-User-Id header required" });
-
-  idea.likedBy.delete(userId);
-  idea.updatedAt = nowISO();
-  broadcast("idea.unliked", { id: idea.id, likeCount: idea.likedBy.size, userId });
-  res.json({ id: idea.id, likeCount: idea.likedBy.size });
-});
-
-// Add comment
-app.post("/ideas/:id/comments", requireAuth, (req, res) => {
-  const idea = state.ideas.find(i => i.id === req.params.id);
-  if (!idea) return res.status(404).json({ error: "not found" });
-
-  const text = (req.body && req.body.text) || "";
-  if (!text.trim()) return res.status(400).json({ error: "text required" });
-
-  const authorId = (req.get("X-User-Id") || req.body.authorId || "").trim();
-  const authorName = (req.get("X-User-Name") || req.body.authorName || "Member").trim();
-
-  const comment = {
-    id: uid("cmt"),
-    text,
-    authorId,
-    authorName,
-    createdAt: nowISO(),
-    updatedAt: nowISO(),
-  };
-  idea.comments.push(comment);
-  idea.updatedAt = nowISO();
-
-  const payload = { ideaId: idea.id, comment };
-  broadcast("comment.created", payload);
-  res.status(201).json(comment);
-});
-
-// Edit comment
-app.patch("/ideas/:id/comments/:cid", requireAuth, (req, res) => {
-  const idea = state.ideas.find(i => i.id === req.params.id);
-  if (!idea) return res.status(404).json({ error: "not found" });
-
-  const c = idea.comments.find(x => x.id === req.params.cid);
-  if (!c) return res.status(404).json({ error: "comment not found" });
-
-  const text = (req.body && req.body.text) || "";
-  if (!text.trim()) return res.status(400).json({ error: "text required" });
-
-  c.text = text;
-  c.updatedAt = nowISO();
-  idea.updatedAt = nowISO();
-
-  const payload = { ideaId: idea.id, comment: c };
-  broadcast("comment.updated", payload);
-  res.json(c);
-});
-
-// Delete comment
-app.delete("/ideas/:id/comments/:cid", requireAuth, (req, res) => {
-  const idea = state.ideas.find(i => i.id === req.params.id);
-  if (!idea) return res.status(404).json({ error: "not found" });
-
-  const idx = idea.comments.findIndex(x => x.id === req.params.cid);
-  if (idx === -1) return res.status(404).json({ error: "comment not found" });
-
-  const [removed] = idea.comments.splice(idx, 1);
-  idea.updatedAt = nowISO();
-
-  broadcast("comment.deleted", { ideaId: idea.id, id: removed.id });
-  res.status(204).end();
-});
-
-// SSE endpoints
-app.get("/events", sseHandler);
-app.get("/ideas/stream", sseHandler);
-
-/* ---------- 404 -> JSON ---------- */
-app.use((req, res, next) => {
-  if (res.headersSent) return next();
-  res.status(404).json({ error: "not found", path: req.originalUrl });
-});
-
-/* ---------- Error handler ---------- */
-app.use((err, _req, res, _next) => {
-  console.error(err);
-  const code = Number.isInteger(err.status) ? err.status : 500;
-  res.status(code).json({ error: err.message || "Internal Server Error" });
-});
-
-/* ---------- Start ---------- */
 app.listen(PORT, () => {
-  console.log(`ideas-backend listening on ${PORT}`);
-  console.log("Allowed origins:", ALLOW_ORIGINS.join(", ") || "*");
-  if (mailer) {
-    console.log("Email: ON (SMTP_URL detected)");
-    console.log("Notify From:", NOTIFY_FROM);
-    console.log("Notify To:", NOTIFY_TO.join(", "));
-  } else {
-    console.log("Email: OFF (missing SMTP_URL/NOTIFY_FROM/NOTIFY_TO)");
-  }
+  console.log(`Ideas backend running on :${PORT}`);
+  console.log('CORS allowlist:', allowlist.join(' | '));
+  console.log(SMTP_URL ? 'Mail: SMTP configured' : 'Mail: SMTP_URL missing (emails will be logged to console)');
+  if (!API_TOKEN)   console.warn('WARN: API_TOKEN not set — Bearer auth disabled.');
+  if (!MAIL_SECRET) console.warn('WARN: MAIL_SECRET not set — X-Mail-Secret disabled.');
+  listRoutes(app);
 });
