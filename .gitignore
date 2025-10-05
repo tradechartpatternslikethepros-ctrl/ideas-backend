@@ -1,6 +1,4 @@
-node_modules/
-.DS_Store
-npm-debug.log*
+node_modules
 .env
-200
-204
+.DS_Store
+ideas-backend-test/
