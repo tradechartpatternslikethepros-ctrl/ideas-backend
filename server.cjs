@@ -1,357 +1,417 @@
-// server.cjs
-// Deps: express cors multer nanoid nodemailer morgan
-// Start: node server.cjs
+// server.cjs  — full production server (CJS) for Railway or local
+// Features:
+//  - Ideas CRUD-lite: list, latest, create, like, comment
+//  - Email notify routes (post + signal) with header secret
+//  - SSE /events stream for live pings
+//  - CORS allowlist with wildcards
+//  - File persistence (ideas.db JSON) + optional base64 image save
+//  - Works for both "/..." and "/api/..." paths
+//  - Ready for Railway (PORT env), logs routes at boot
 
-const fs = require("fs");
-const path = require("path");
-const express = require("express");
-const cors = require("cors");
-const multer = require("multer");
-const { nanoid } = require("nanoid");
-const nodemailer = require("nodemailer");
-let morgan = null; try { morgan = require("morgan"); } catch {}
+// -------------------- imports --------------------
+const express = require('express');
+const fs = require('fs');
+const fsp = fs.promises;
+const path = require('path');
+const crypto = require('crypto');
+const cors = require('cors');
+const rateLimit = require('express-rate-limit');
+const nodemailer = require('nodemailer');
 
-const PORT = Number(process.env.PORT || 8080);
-const DATA_FILE = path.join(__dirname, "ideas.db");
-const UPLOADS_DIR = path.join(__dirname, "uploads");
+// -------------------- config --------------------
+const env = (k, d) => (process.env[k] && String(process.env[k]).trim()) || d;
 
-// ---- CORS allowlist ----
-const RAW_ALLOW = String(process.env.ALLOW_ORIGINS || "")
-  .split(",").map(s => s.trim()).filter(Boolean);
-const WILDCARDS = RAW_ALLOW.filter(s => s.startsWith("*.")).map(s => s.slice(1)); // ".filesusr.com"
-const EXACTS = new Set(RAW_ALLOW.filter(s => !s.startsWith("*.")));
+const PORT = Number(process.env.PORT) || 8080;
+const DATA_FILE = env('DATA_FILE', path.join(process.cwd(), 'ideas.db'));
+const UPLOAD_DIR = env('UPLOAD_DIR', path.join(process.cwd(), 'uploads'));
+const API_TOKEN = env(
+  'API_TOKEN',
+  // fallback to your provided token so it just works if not set in Railway
+  '4a6ffbf3209fb1392341615d5b6abc6f4db5998a22d825f2615dfd22e3965dfa'
+);
+const MAIL_SECRET = env('MAIL_SECRET', 'superlongrandomstring');
+const SMTP_URL = env(
+  'SMTP_URL',
+  'smtp://559c7d76b88bbc4988c014de3630f96c:8ef6a407c50354ec9101604ad9899aad@in-v3.mailjet.com:587'
+);
+const MAIL_FROM = env(
+  'MAIL_FROM',
+  'Pro Members <no-reply@tradechartpatternslikethepros.com>'
+);
+const NOTIFY_TO = env(
+  'NOTIFY_TO',
+  'alerts@tradechartpatternslikethepros.com'
+);
+const SUBSCRIBERS = env(
+  'SUBSCRIBERS',
+  'alerts@tradechartpatternslikethepros.com,tinomorgado@me.com'
+);
 
-// ---- App setup ----
+// comma-separated; supports wildcards like *.wixsite.com
+const ALLOW_ORIGINS = env(
+  'ALLOW_ORIGINS',
+  [
+    'https://www.tradechartpatternslikethepros.com',
+    'https://tradechartpatternslikethepros.com',
+    '*.filesusr.com',
+    '*.wixsite.com',
+    '*.wixstatic.com',
+    '*.parastorage.com',
+    'https://editor.wix.com',
+    'https://www.wix.com',
+    'http://localhost:3000',
+    'http://127.0.0.1:3000',
+    'http://localhost:5173',
+    'http://127.0.0.1:5173'
+  ].join(',')
+);
+
+// -------------------- app --------------------
 const app = express();
-if (morgan) app.use(morgan("tiny"));
-app.disable("x-powered-by");
-app.set("etag", false);
-app.use((_, res, next) => { res.set("Cache-Control","no-store"); res.set("Pragma","no-cache"); res.set("Expires","0"); next(); });
-app.use(express.json({ limit: "4mb" }));
+app.set('trust proxy', 1); // behind Railway/Cloudflare
+
+// body parsers
+app.use(express.json({ limit: '2mb' }));
 app.use(express.urlencoded({ extended: false }));
 
-app.use(cors({
-  origin(origin, cb) {
-    if (!origin) return cb(null, true);
-    try {
-      if (EXACTS.has(origin)) return cb(null, true);
-      const host = new URL(origin).hostname;
-      if (WILDCARDS.some(suf => host.endsWith(suf))) return cb(null, true);
-    } catch {}
-    return cb(null, false);
-  },
-  credentials: false,
-  optionsSuccessStatus: 200
-}));
+// uploads (for saved base64 images)
+fs.mkdirSync(UPLOAD_DIR, { recursive: true });
+app.use('/uploads', express.static(UPLOAD_DIR, { maxAge: '30d', etag: true }));
 
-// ---- Storage ----
-if (!fs.existsSync(UPLOADS_DIR)) fs.mkdirSync(UPLOADS_DIR, { recursive: true });
-if (!fs.existsSync(DATA_FILE)) fs.writeFileSync(DATA_FILE, JSON.stringify({ ideas: [] }, null, 2));
+// CORS allowlist (wildcards)
+const originGlobs = ALLOW_ORIGINS.split(',').map(s => s.trim()).filter(Boolean);
+const globToRegex = glob => {
+  if (glob === '*') return /^.*$/i;
+  let g = glob.replace(/\./g, '\\.').replace(/\*/g, '.*');
+  if (!/^https?:\/\//.test(g)) g = 'https?:\\/\\/' + g;
+  return new RegExp('^' + g + '$', 'i');
+};
+const allowlist = originGlobs.map(globToRegex);
 
-const upload = multer({ dest: UPLOADS_DIR });
+app.use(
+  cors({
+    origin: (origin, cb) => {
+      if (!origin) return cb(null, true); // curl, server-to-server
+      const ok = allowlist.some(rx => rx.test(origin));
+      return cb(ok ? null : new Error('Not allowed by CORS'), ok);
+    },
+    credentials: false
+  })
+);
 
-function load() { try { return JSON.parse(fs.readFileSync(DATA_FILE, "utf8")); } catch { return { ideas: [] }; } }
-function save(s) { fs.writeFileSync(DATA_FILE, JSON.stringify(s, null, 2)); }
+// basic rate limit (per IP via trust proxy)
+app.use(
+  rateLimit({
+    windowMs: 60 * 1000,
+    limit: 120,
+    standardHeaders: true,
+    legacyHeaders: false
+  })
+);
 
-let state = load(); // { ideas: [ ... ] }
+// -------------------- persistence --------------------
+const state = {
+  ideas: []
+};
 
-// ---- Email ----
-const NOTIFY_TO = (process.env.NOTIFY_TO || "").split(",").map(s => s.trim()).filter(Boolean);
-const SUBSCRIBERS = new Set((process.env.SUBSCRIBERS || "").split(",").map(s => s.trim().toLowerCase()).filter(Boolean));
-
-let mailer = null;
-if (process.env.SMTP_URL) {
-  mailer = nodemailer.createTransport(process.env.SMTP_URL);
-} else if (process.env.SMTP_HOST) {
-  mailer = nodemailer.createTransport({
-    host: process.env.SMTP_HOST,
-    port: Number(process.env.SMTP_PORT || 587),
-    secure: String(process.env.SMTP_SECURE || "false") !== "false",
-    auth: (process.env.SMTP_USER && process.env.SMTP_PASS) ? { user: process.env.SMTP_USER, pass: process.env.SMTP_PASS } : undefined
-  });
-} else {
-  // dev fallback: log emails to console
-  mailer = nodemailer.createTransport({ jsonTransport: true });
-}
-
-async function sendMail({ subject, html, to = [] }) {
-  const merged = [...new Set([...(to||[]), ...NOTIFY_TO])].filter(Boolean);
-  const paidOnly = merged.filter(e => SUBSCRIBERS.size ? SUBSCRIBERS.has(e.toLowerCase()) : true);
-  const finalTo = paidOnly.length ? paidOnly.join(", ") : (NOTIFY_TO[0] || "console@logs.local");
+async function load() {
   try {
-    await mailer.sendMail({
-      from: process.env.MAIL_FROM || "Pro Members <no-reply@example.com>",
-      to: finalTo,
-      subject: subject || "(no subject)",
-      html: html || "<p>(empty)</p>"
-    });
-  } catch (e) {
-    console.warn("[email] failed:", e.message);
+    const raw = await fsp.readFile(DATA_FILE, 'utf8');
+    const json = JSON.parse(raw);
+    if (Array.isArray(json)) state.ideas = json;
+    else if (Array.isArray(json.ideas)) state.ideas = json.ideas;
+  } catch (_) {
+    state.ideas = [];
+    await persist();
   }
 }
 
-// ---- SSE (realtime) ----
-const clients = new Set();
-function sseBroadcast(event, payload) {
-  const line = `event: ${event}\n` + `data: ${JSON.stringify(payload)}\n\n`;
-  for (const res of clients) { try { res.write(line); } catch {} }
+let persistWrite = Promise.resolve();
+async function persist() {
+  const snapshot = JSON.stringify(state.ideas, null, 2);
+  // serialize writes
+  persistWrite = persistWrite.then(() =>
+    fsp.writeFile(DATA_FILE, snapshot, 'utf8').catch(() => {})
+  );
+  return persistWrite;
 }
-app.get("/events", (req, res) => {
-  res.setHeader("Content-Type", "text/event-stream");
-  res.setHeader("Cache-Control", "no-cache, no-transform");
-  res.setHeader("Connection", "keep-alive");
-  res.setHeader("X-Accel-Buffering", "no");
+
+// -------------------- utils --------------------
+const uuid = () => crypto.randomUUID();
+const nowISO = () => new Date().toISOString();
+
+function sanitizeIdea(idea) {
+  // expose everything except potential internal fields
+  const {
+    id,
+    title,
+    content,
+    symbol,
+    tf,
+    likes = 0,
+    comments = [],
+    imageUrl,
+    createdAt,
+    updatedAt
+  } = idea;
+  return {
+    id,
+    title,
+    content,
+    symbol,
+    tf,
+    likes,
+    comments,
+    imageUrl,
+    createdAt,
+    updatedAt
+  };
+}
+
+async function saveBase64ImageMaybe(b64) {
+  try {
+    if (!b64 || typeof b64 !== 'string') return null;
+    const m = b64.match(/^data:(image\/[a-zA-Z0-9.+-]+);base64,(.+)$/);
+    if (!m) return null;
+    const ext = m[1].split('/')[1].toLowerCase().replace('+xml', '');
+    const buf = Buffer.from(m[2], 'base64');
+    const name = uuid() + '.' + (ext || 'png');
+    const filePath = path.join(UPLOAD_DIR, name);
+    await fsp.writeFile(filePath, buf);
+    return `/uploads/${name}`;
+  } catch {
+    return null;
+  }
+}
+
+// helper to mount both /x and /api/x
+const dual = (method, p, h) => {
+  app[method](p, h);
+  app[method]('/api' + p, h);
+};
+
+// -------------------- email --------------------
+let transporter = null;
+if (SMTP_URL) {
+  try {
+    transporter = nodemailer.createTransport(SMTP_URL);
+    // probe connection on boot (non-blocking)
+    transporter
+      .verify()
+      .then(() => console.log('Mail: SMTP configured'))
+      .catch(err => console.log('Mail: SMTP verify failed', err?.message || err));
+  } catch (e) {
+    console.log('Mail: transporter init failed', e?.message || e);
+  }
+}
+
+async function sendEmail({ subject, text, html, to }) {
+  if (!transporter) throw new Error('SMTP not configured');
+  const opts = {
+    from: MAIL_FROM,
+    to: to || SUBSCRIBERS,
+    subject,
+    text: text || html?.replace(/<[^>]+>/g, ' '),
+    html
+  };
+  return transporter.sendMail(opts);
+}
+
+// -------------------- routes --------------------
+dual('get', '/', (_req, res) => {
+  res.json({
+    name: 'ideas-backend',
+    version: 1,
+    routes: [
+      'GET /, /api',
+      'GET /health, /api/health, /api/v1/health',
+      'GET /events, /api/events (SSE)',
+      'GET /ideas, /api/ideas',
+      'GET /ideas/latest, /api/ideas/latest',
+      'POST /ideas, /api/ideas  (x-api-token)',
+      'PUT /ideas/:id/likes, /api/ideas/:id/likes',
+      'POST /ideas/:id/comments, /api/ideas/:id/comments',
+      'POST /notify-post, /api/notify-post  (x-mail-secret)',
+      'POST /notify-signal, /api/notify-signal (x-mail-secret)'
+    ]
+  });
+});
+dual('get', '/health', (_req, res) => res.json({ ok: true, ts: Date.now() }));
+app.get('/api/v1/health', (_req, res) => res.json({ ok: true, ts: Date.now() }));
+
+// ---- SSE heartbeat for clients that want "live" feel ----
+const sseClients = new Set();
+dual('get', '/events', (req, res) => {
+  res.set({
+    'Content-Type': 'text/event-stream',
+    'Cache-Control': 'no-cache',
+    Connection: 'keep-alive'
+  });
   res.flushHeaders?.();
-  res.write("retry: 5000\n\n");
-  res.write(`event: hello\ndata: ${JSON.stringify({ ts: Date.now() })}\n\n`);
-  clients.add(res);
-  const hb = setInterval(() => { try { res.write(":\n\n"); } catch {} }, 10000);
-  req.on("close", () => { clearInterval(hb); clients.delete(res); });
+  res.write('retry: 15000\n\n');
+
+  const client = { res };
+  sseClients.add(client);
+  req.on('close', () => sseClients.delete(client));
 });
-
-// ---- Static uploads ----
-app.use("/uploads", express.static(UPLOADS_DIR, {
-  fallthrough: false, etag: false, lastModified: false, cacheControl: false
-}));
-
-// ---- Helpers ----
-function sanitizeFile(f) {
-  if (!f) return null;
-  return { filename: f.filename, originalname: f.originalname, url: `/uploads/${f.filename}` };
+function sseBroadcast(evt, data) {
+  const payload = `event: ${evt}\ndata: ${JSON.stringify(data)}\n\n`;
+  for (const { res } of sseClients) res.write(payload);
 }
-function ideaPublic(i, { withComments = false } = {}) {
-  const base = {
-    id: i.id, type: i.type || "post",
-    title: i.title || "", symbol: i.symbol || "", link: i.link || "",
-    levelText: i.levelText || "", take: i.take || "",
-    imageUrl: i.imageUrl || "", imageData: i.imageData || "",
-    createdAt: i.createdAt, updatedAt: i.updatedAt,
-    likeCount: (i.likedBy ? i.likedBy.size || i.likedBy.length : 0),
-    commentCount: (i.comments || []).length,
-    authorName: i.authorName || "Member", authorId: i.authorId || ""
-  };
-  if (withComments) base.comments = (i.comments || []).map(c => ({
-    id: c.id, text: c.text || "", authorName: c.authorName || "Member",
-    authorId: c.authorId || "", createdAt: c.createdAt, updatedAt: c.updatedAt
-  }));
-  return base;
-}
-function idxById(id) { return state.ideas.findIndex(x => x.id === id); }
+setInterval(() => sseBroadcast('ping', { t: Date.now() }), 30000);
 
-// ---- Health ----
-app.get("/health", (_req, res) => res.json({ ok: true }));
-
-// ---- Read ----
-app.get("/ideas", (_req, res) => {
-  res.json(state.ideas.map(i => ideaPublic(i)));
+// ---- ideas list ----
+dual('get', '/ideas', (_req, res) => {
+  res.json(state.ideas.map(sanitizeIdea));
 });
 
-app.get("/ideas/latest", (_req, res) => {
-  const latest = state.ideas.length ? ideaPublic(state.ideas[state.ideas.length - 1]) : null;
-  res.json(latest || {});
+// ---- latest (single) ----
+dual('get', '/ideas/latest', (_req, res) => {
+  const latest = state.ideas[0] ? sanitizeIdea(state.ideas[0]) : null;
+  res.json(latest);
 });
 
-app.get("/ideas/:id", (req, res) => {
-  const i = idxById(req.params.id);
-  if (i === -1) return res.status(404).json({ error: "not_found" });
-  res.json(ideaPublic(state.ideas[i], { withComments: true }));
-});
-
-// ---- Create (JSON or multipart with file) ----
-app.post("/ideas", upload.single("file"), async (req, res) => {
-  const now = new Date().toISOString();
-  const body = req.is("multipart/form-data") ? req.body : (req.body || {});
-  const f = req.file ? sanitizeFile(req.file) : null;
-
-  const idea = {
-    id: nanoid(12),
-    type: body.type || "post",
-    title: String(body.title || "").trim(),
-    symbol: String(body.symbol || "").trim(),
-    link: String(body.link || "").trim(),
-    levelText: String(body.levelText || body.levels || "").trim(),
-    take: String(body.take || body.myTake || "").trim(),
-    imageUrl: f ? f.url : String(body.imageUrl || ""),
-    imageData: String(body.imageData || ""), // base64 (optional)
-    authorName: String(body.authorName || "Member"),
-    authorId: String(body.authorId || ""),
-    createdAt: now,
-    updatedAt: now,
-    likedBy: new Set(),     // store as Set in memory
-    comments: []            // [{id,text,author...}]
-  };
-
-  state.ideas.push(idea);
-  save({ ideas: state.ideas.map(x => ({ ...x, likedBy: Array.from(x.likedBy || []) })) });
-
-  const pub = ideaPublic(idea);
-  sseBroadcast("idea.created", pub);
-
-  // Email: New idea
+// ---- create idea (requires x-api-token) ----
+dual('post', '/ideas', async (req, res) => {
   try {
-    await sendMail({
-      subject: `New idea: ${pub.title || "(untitled)"}`,
-      html: `<h3>${pub.title || "(untitled)"}</h3>
-             <p><b>Symbol:</b> ${pub.symbol || "-"}<br/>
-             <b>Levels:</b> ${pub.levelText || "-"}<br/>
-             <b>Take:</b> ${pub.take || "-"}</p>`
-    });
-  } catch {}
+    const token = req.get('x-api-token');
+    if (token !== API_TOKEN) return res.status(401).json({ error: 'unauthorized' });
 
-  res.status(201).json(pub);
+    const { title, content, symbol, tf, imageBase64 } = req.body || {};
+    if (!title || !content) return res.status(400).json({ error: 'title and content required' });
+
+    let imageUrl = null;
+    if (imageBase64) imageUrl = await saveBase64ImageMaybe(imageBase64);
+
+    const idea = {
+      id: uuid(),
+      title: String(title).slice(0, 180),
+      content: String(content).slice(0, 10000),
+      symbol: symbol ? String(symbol).slice(0, 24) : undefined,
+      tf: tf ? String(tf).slice(0, 16) : undefined,
+      imageUrl: imageUrl || undefined,
+      likes: 0,
+      comments: [],
+      createdAt: nowISO(),
+      updatedAt: nowISO()
+    };
+
+    state.ideas.unshift(idea);
+    await persist();
+    sseBroadcast('new_idea', sanitizeIdea(idea));
+
+    res.status(201).json(sanitizeIdea(idea));
+  } catch (e) {
+    res.status(500).json({ error: 'server', detail: e?.message || String(e) });
+  }
 });
 
-// ---- Update ----
-app.patch("/ideas/:id", (req, res) => {
-  const i = idxById(req.params.id);
-  if (i === -1) return res.status(404).json({ error: "not_found" });
-  const it = state.ideas[i];
-  const p = req.body || {};
-  ["type","title","symbol","link","levelText","take","imageUrl","imageData","authorName","authorId"].forEach(k=>{
-    if (p[k] !== undefined) it[k] = p[k];
+// ---- like / unlike ----
+dual('put', '/ideas/:id/likes', async (req, res) => {
+  const { id } = req.params;
+  const { delta } = req.body || {};
+  if (typeof delta !== 'number' || !Number.isFinite(delta)) {
+    return res.status(400).json({ error: 'delta must be a number' });
+  }
+  const idea = state.ideas.find(i => i.id === id);
+  if (!idea) return res.status(404).json({ error: 'idea not found' });
+  idea.likes = Math.max(0, (idea.likes || 0) + Math.trunc(delta));
+  idea.updatedAt = nowISO();
+  await persist();
+  sseBroadcast('likes', { id: idea.id, likes: idea.likes });
+  res.json(sanitizeIdea(idea));
+});
+
+// ---- add comment ----
+dual('post', '/ideas/:id/comments', async (req, res) => {
+  const { id } = req.params;
+  const { author, text } = req.body || {};
+  if (!text || typeof text !== 'string') {
+    return res.status(400).json({ error: 'text is required' });
+  }
+  const idea = state.ideas.find(i => i.id === id);
+  if (!idea) return res.status(404).json({ error: 'idea not found' });
+
+  const comment = {
+    id: uuid(),
+    author: (author && String(author).slice(0, 60)) || 'Anon',
+    text: String(text).slice(0, 2000),
+    createdAt: nowISO()
+  };
+  idea.comments = Array.isArray(idea.comments) ? idea.comments : [];
+  idea.comments.unshift(comment);
+  idea.updatedAt = comment.createdAt;
+  await persist();
+  sseBroadcast('comment', { ideaId: idea.id, comment });
+  res.status(201).json(comment);
+});
+
+// ---- email notify (post created) ----
+dual('post', '/notify-post', async (req, res) => {
+  try {
+    if (req.get('x-mail-secret') !== MAIL_SECRET) {
+      return res.status(401).json({ error: 'unauthorized' });
+    }
+    const { title, url } = req.body || {};
+    const subject = `New Post: ${title || 'Update'}`;
+    const html = `<p><strong>${title || 'New Post'}</strong></p><p><a href="${url ||
+      '#'}" target="_blank" rel="noopener">Open Dashboard</a></p>`;
+    await sendEmail({ subject, html, to: NOTIFY_TO });
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(500).json({ error: 'mail_failed', detail: e?.message || String(e) });
+  }
+});
+
+// ---- email notify (signal live/tp/sl) ----
+dual('post', '/notify-signal', async (req, res) => {
+  try {
+    if (req.get('x-mail-secret') !== MAIL_SECRET) {
+      return res.status(401).json({ error: 'unauthorized' });
+    }
+    const { symbol, tf, status, price, note, url } = req.body || {};
+    const title = `Signal ${status || ''} — ${symbol || ''} ${tf || ''}`.trim();
+    const html =
+      `<p><strong>${title}</strong></p>` +
+      (price ? `<p>Price: ${price}</p>` : '') +
+      (note ? `<p>${String(note).slice(0, 500)}</p>` : '') +
+      `<p><a href="${url || '#'}" target="_blank" rel="noopener">Open Dashboard</a></p>`;
+    await sendEmail({ subject: title, html, to: SUBSCRIBERS });
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(500).json({ error: 'mail_failed', detail: e?.message || String(e) });
+  }
+});
+
+// -------------------- boot --------------------
+(async () => {
+  await load();
+  app.listen(PORT, () => {
+    console.log(`Ideas backend running on :${PORT}`);
+    console.log(
+      'CORS allowlist:',
+      originGlobs.join(' | ')
+    );
+    console.log('Mail:', transporter ? 'SMTP configured' : 'SMTP disabled');
+
+    // log routes
+    console.log('ROUTES:');
+    const list = [];
+    for (const layer of app._router.stack) {
+      if (layer.route) {
+        const p = layer.route.path;
+        const methods = Object.keys(layer.route.methods)
+          .filter(Boolean)
+          .map(m => m.toUpperCase())
+          .join(',');
+        list.push(`${methods} ${p}`);
+      }
+    }
+    // also show /api mirrors (dual)
+    list.push('GET /api, GET /api/health, GET /api/v1/health, GET /api/events');
+    list.push('GET /api/ideas, GET /api/ideas/latest');
+    list.push('POST /api/ideas, PUT /api/ideas/:id/likes, POST /api/ideas/:id/comments');
+    list.push('POST /api/notify-post, POST /api/notify-signal');
+    for (const r of list) console.log(r);
   });
-  it.updatedAt = new Date().toISOString();
-
-  save({ ideas: state.ideas.map(x => ({ ...x, likedBy: Array.from(x.likedBy || []) })) });
-  const pub = ideaPublic(it);
-  sseBroadcast("idea.updated", pub);
-  res.json(pub);
-});
-
-// ---- Delete ----
-app.delete("/ideas/:id", (req, res) => {
-  const i = idxById(req.params.id);
-  if (i === -1) return res.status(404).json({ error: "not_found" });
-  const removed = ideaPublic(state.ideas[i]);
-  state.ideas.splice(i, 1);
-  save({ ideas: state.ideas.map(x => ({ ...x, likedBy: Array.from(x.likedBy || []) })) });
-  sseBroadcast("idea.deleted", removed);
-  res.status(204).end();
-});
-
-// ---- Likes (POST like, DELETE unlike) ----
-app.post("/ideas/:id/like", (req, res) => {
-  const i = idxById(req.params.id);
-  if (i === -1) return res.status(404).json({ error: "not_found" });
-  const uid = String(req.get("X-User-Id") || "").trim() || "anon";
-  if (!state.ideas[i].likedBy) state.ideas[i].likedBy = new Set();
-  state.ideas[i].likedBy.add(uid);
-  const likeCount = state.ideas[i].likedBy.size;
-  save({ ideas: state.ideas.map(x => ({ ...x, likedBy: Array.from(x.likedBy || []) })) });
-  sseBroadcast("idea.liked", { id: state.ideas[i].id, likeCount });
-  res.json({ ok: true, likeCount });
-});
-
-app.delete("/ideas/:id/like", (req, res) => {
-  const i = idxById(req.params.id);
-  if (i === -1) return res.status(404).json({ error: "not_found" });
-  const uid = String(req.get("X-User-Id") || "").trim() || "anon";
-  if (!state.ideas[i].likedBy) state.ideas[i].likedBy = new Set();
-  state.ideas[i].likedBy.delete(uid);
-  const likeCount = state.ideas[i].likedBy.size;
-  save({ ideas: state.ideas.map(x => ({ ...x, likedBy: Array.from(x.likedBy || []) })) });
-  sseBroadcast("idea.unliked", { id: state.ideas[i].id, likeCount });
-  res.json({ ok: true, likeCount });
-});
-
-// ---- Comments CRUD ----
-app.get("/ideas/:id/comments", (req, res) => {
-  const i = idxById(req.params.id);
-  if (i === -1) return res.status(404).json({ error: "not_found" });
-  const items = (state.ideas[i].comments || []).map(c => ({
-    id: c.id, text: c.text, authorName: c.authorName, authorId: c.authorId,
-    createdAt: c.createdAt, updatedAt: c.updatedAt
-  }));
-  res.json(items);
-});
-
-app.post("/ideas/:id/comments", (req, res) => {
-  const i = idxById(req.params.id);
-  if (i === -1) return res.status(404).json({ error: "not_found" });
-  const { text = "", authorId = "", authorName = "Member" } = req.body || {};
-  const cm = {
-    id: nanoid(10),
-    text: String(text || "").trim(),
-    authorId: String(authorId || ""),
-    authorName: String(authorName || "Member"),
-    createdAt: new Date().toISOString(),
-    updatedAt: null
-  };
-  state.ideas[i].comments = state.ideas[i].comments || [];
-  state.ideas[i].comments.push(cm);
-  save({ ideas: state.ideas.map(x => ({ ...x, likedBy: Array.from(x.likedBy || []) })) });
-  sseBroadcast("comment.created", { ideaId: state.ideas[i].id, comment: cm });
-  res.status(201).json({ ok: true, items: state.ideas[i].comments.map(c => ({
-    id: c.id, text: c.text, authorName: c.authorName, authorId: c.authorId,
-    createdAt: c.createdAt, updatedAt: c.updatedAt
-  })) });
-});
-
-app.patch("/ideas/:id/comments/:cid", (req, res) => {
-  const i = idxById(req.params.id);
-  if (i === -1) return res.status(404).json({ error: "not_found" });
-  const list = state.ideas[i].comments || [];
-  const j = list.findIndex(c => c.id === req.params.cid);
-  if (j === -1) return res.status(404).json({ error: "not_found" });
-  if (req.body.text !== undefined) list[j].text = String(req.body.text);
-  list[j].updatedAt = new Date().toISOString();
-  save({ ideas: state.ideas.map(x => ({ ...x, likedBy: Array.from(x.likedBy || []) })) });
-  sseBroadcast("comment.updated", { ideaId: state.ideas[i].id, comment: list[j] });
-  res.json({ ok: true, items: list.map(c => ({
-    id: c.id, text: c.text, authorName: c.authorName, authorId: c.authorId,
-    createdAt: c.createdAt, updatedAt: c.updatedAt
-  })) });
-});
-
-app.delete("/ideas/:id/comments/:cid", (req, res) => {
-  const i = idxById(req.params.id);
-  if (i === -1) return res.status(404).json({ error: "not_found" });
-  const list = state.ideas[i].comments || [];
-  const before = list.length;
-  state.ideas[i].comments = list.filter(c => c.id !== req.params.cid);
-  if (state.ideas[i].comments.length === before) return res.status(404).json({ error: "not_found" });
-  save({ ideas: state.ideas.map(x => ({ ...x, likedBy: Array.from(x.likedBy || []) })) });
-  sseBroadcast("comment.deleted", { ideaId: state.ideas[i].id, commentId: req.params.cid });
-  res.status(204).end();
-});
-
-// ---- Email notify endpoints (optional; no secret required) ----
-app.post("/api/notify-post", async (req, res) => {
-  const p = req.body || {};
-  try {
-    await sendMail({
-      subject: `New Post: ${p.title || "(untitled)"}`,
-      html: `<h3>${p.title || "(untitled)"}</h3>
-             <p><b>Symbol:</b> ${p.symbol || "-"}<br/>
-             <b>Link:</b> ${p.link || "-"}<br/>
-             <b>Levels:</b> ${p.levelText || "-"}<br/>
-             <b>By:</b> ${p.authorName || "Member"} (${p.authorEmail || "-"})</p>`,
-      to: Array.isArray(p.to) ? p.to : undefined
-    });
-    res.json({ ok: true });
-  } catch (e) {
-    res.status(500).json({ ok: false, error: e.message });
-  }
-});
-
-app.post("/api/notify-signal", async (req, res) => {
-  const p = req.body || {};
-  try {
-    await sendMail({
-      subject: `Signal: ${String(p.type || "signal").toUpperCase()} — ${p.title || "(untitled)"}`,
-      html: `<h3>${p.title || "(untitled)"} — ${String(p.type || "signal").toUpperCase()}</h3>
-             <p><b>Symbol:</b> ${p.symbol || "-"}<br/>
-             <b>When:</b> ${p.when || new Date().toISOString()}</p>`,
-      to: Array.isArray(p.to) ? p.to : undefined
-    });
-    res.json({ ok: true });
-  } catch (e) {
-    res.status(500).json({ ok: false, error: e.message });
-  }
-});
-
-// ---- Start ----
-app.listen(PORT, () => {
-  console.log(`ideas-backend listening on ${PORT}`);
-  console.log(`Allowed origins: ${RAW_ALLOW.join(", ")}`);
-});
+})();
